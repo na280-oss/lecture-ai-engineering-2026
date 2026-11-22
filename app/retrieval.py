@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -125,6 +126,48 @@ def open_index(path: Path):
 
 
 def search(query: str) -> list[dict]:
+    """質問に近いページを最大RAG_TOP_K件返す。AIE_RAG_NEIGHBORS=1 のときは前後1ページも付ける。"""
+    hits = vector_search(query)
+    if os.getenv("AIE_RAG_NEIGHBORS", "") not in ("1", "true", "yes", "on"):
+        return hits
+    return add_neighbor_pages(hits, load_pages(RAG_SOURCE))
+
+
+def add_neighbor_pages(hits: list[dict], pages: list[dict]) -> list[dict]:
+    """各検索結果の前後1ページを、同じ資料の中だけから足す。同じページは1度しか返さない。
+
+    返す順は「前のページ → 検索結果 → 次のページ」。足したページには neighbor_of（どの検索結果の前後か）
+    と relation（"prev" / "next"）を付け、検索で当たったページには relation="hit" を付ける。
+    """
+    by_document = defaultdict(list)
+    for page in pages:
+        by_document[page["document_id"]].append(page)
+    position = {page["page_id"]: (page["document_id"], i)
+                for document_pages in by_document.values() for i, page in enumerate(document_pages)}
+
+    hit_ids = {hit["page_id"] for hit in hits}
+    seen, results = set(), []
+
+    def add(page: dict, **extra):
+        if page["page_id"] not in seen:
+            seen.add(page["page_id"])
+            results.append({**page, **extra})
+
+    for hit in hits:
+        document_id, i = position.get(hit["page_id"], (None, None))
+        document_pages = by_document.get(document_id, [])
+        prev_page = document_pages[i - 1] if i is not None and i > 0 else None
+        next_page = document_pages[i + 1] if i is not None and i + 1 < len(document_pages) else None
+        # 前後のページが別の検索結果なら、ここでは足さず、その検索結果として返す
+        if prev_page and prev_page["page_id"] not in hit_ids:
+            add(prev_page, relation="prev", neighbor_of=hit["page_id"])
+        add(hit, relation="hit")
+        if next_page and next_page["page_id"] not in hit_ids:
+            add(next_page, relation="next", neighbor_of=hit["page_id"])
+    return results
+
+
+def vector_search(query: str) -> list[dict]:
     """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
@@ -151,7 +194,7 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [hit for hit in vector_search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
@@ -201,9 +244,15 @@ def run_full_context(agent, question: str, model, instructions: str, prompt_temp
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="エージェントを使わず、講義資料の検索だけを実行する")
     parser.add_argument("query", help="調べたい内容")
+    parser.add_argument("--neighbors", action="store_true", help="検索結果の前後1ページも表示する")
     args = parser.parse_args()
+    if args.neighbors:
+        os.environ["AIE_RAG_NEIGHBORS"] = "1"
+    labels = {"prev": "前のページ", "next": "次のページ"}
     for i, result in enumerate(search(args.query), 1):
-        print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+        relation = result.get("relation", "hit")
+        tag = "" if relation == "hit" else f"（{result['neighbor_of']} の{labels[relation]}）"
+        print(f"\n{'=' * 60}\n検索結果 {i}{tag}\n{'=' * 60}")
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
